@@ -68,6 +68,38 @@ STEALTH = r"""
 """
 
 
+# The decorative NVIDIA Nebula animates 250 particles continuously. It is
+# unrelated to inference or hCaptcha, but keeps both the renderer and software
+# compositor busy. Disable only that canvas and its requestAnimationFrame loop.
+# The rAF filter also stops an already-running loop when applied through CDP,
+# allowing a live browser to be patched without navigation or service downtime.
+NEBULA_SUPPRESSION = r"""
+(() => {
+  if (window.__nvNebulaDisabled) return;
+  window.__nvNebulaDisabled = true;
+
+  const originalGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function(type, ...args) {
+    if (type === '2d' && this.parentElement?.dataset?.testid === 'nv-nebula') {
+      return null;
+    }
+    return originalGetContext.call(this, type, ...args);
+  };
+
+  const originalRaf = window.requestAnimationFrame.bind(window);
+  window.requestAnimationFrame = function(callback) {
+    let source = '';
+    try { source = Function.prototype.toString.call(callback); } catch (e) {}
+    if (source.includes('scaleOrbit') &&
+        source.includes('particles') &&
+        source.includes('clearRect')) {
+      return 0;
+    }
+    return originalRaf(callback);
+  };
+})();
+"""
+
 def wait_cdp(timeout=120):
     end = time.time() + timeout
     while time.time() < end:
@@ -88,6 +120,7 @@ def main():
     c.call("Page.enable")
     # 1) script that runs before any page script on every new document
     c.call("Page.addScriptToEvaluateOnNewDocument", source=STEALTH)
+    c.call("Page.addScriptToEvaluateOnNewDocument", source=NEBULA_SUPPRESSION)
     # 2) consistent UA / platform
     c.call("Network.setUserAgentOverride", userAgent=UA, acceptLanguage="en-US,en",
            platform="Linux x86_64")
