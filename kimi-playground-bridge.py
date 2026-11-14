@@ -21,21 +21,63 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
 CDP_HTTP = os.environ.get("KIMI_CDP", "http://127.0.0.1:9333")
-PAGE_URL = "https://build.nvidia.com/moonshotai/kimi-k3_1-pro/playground"
+
+
+def _default_models():
+    return {
+        "moonshotai/kimi-k3.1-pro": {
+            "page": "https://build.nvidia.com/moonshotai/kimi-k3_1-pro/playground",
+            "slug": "kimi-k3_1-pro",
+            "fnid": "b79234a1-64e1-479e-87e7-1c8e3af74262",
+            "context": 262144,
+            "max_out": 65536,
+        },
+    }
+
+
+MODELS = json.loads(os.environ["KIMI_MODELS"]) if os.environ.get("KIMI_MODELS") else _default_models()
+MODEL = os.environ.get("KIMI_MODEL", "moonshotai/kimi-k3.1-pro")
+if MODEL not in MODELS:
+    MODELS[MODEL] = {
+        "page": os.environ.get("KIMI_PAGE_URL", "https://build.nvidia.com/moonshotai/kimi-k3_1-pro/playground"),
+        "slug": os.environ.get("KIMI_SLUG", "kimi-k3_1-pro"),
+        "fnid": os.environ.get("KIMI_FUNCTION_ID", "b79234a1-64e1-479e-87e7-1c8e3af74262"),
+        "context": 262144,
+    }
+PAGE_URL = MODELS[MODEL]["page"]
 UPSTREAM = os.environ.get(
     "KIMI_UPSTREAM",
-    "https://buildapi.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/kimi-k3_1-pro",
+    "https://buildapi.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/" + MODELS[MODEL]["slug"],
 )
-FUNCTION_ID = os.environ.get("KIMI_FUNCTION_ID", "b79234a1-64e1-479e-87e7-1c8e3af74262")
-MODEL = os.environ.get("KIMI_MODEL", "moonshotai/kimi-k3.1-pro")
+FUNCTION_ID = os.environ.get("KIMI_FUNCTION_ID", MODELS[MODEL]["fnid"])
+
+
+def resolve_model(name):
+    if not name:
+        return MODEL, MODELS[MODEL]
+    if name in MODELS:
+        return name, MODELS[name]
+    for mid, cfg in MODELS.items():
+        if mid.split("/", 1)[-1] == name or cfg.get("slug") == name:
+            return mid, cfg
+    return name, None
+
+
+def upstream_for(cfg):
+    return "https://buildapi.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/" + cfg["slug"]
 PORT = int(os.environ.get("KIMI_BRIDGE_PORT", "8120"))
 TOTAL_TIMEOUT = float(os.environ.get("KIMI_TIMEOUT", "900"))
 IDLE_TIMEOUT = float(os.environ.get("KIMI_IDLE_TIMEOUT", "120"))
 MAX_STREAM_BYTES = int(float(os.environ.get("KIMI_MAX_STREAM_MB", "64")) * 1_000_000)
-# Upstream slots: ten parallel turns by default, while keeping a bound so a
+# Upstream slots: fifty parallel turns by default, while keeping a bound so a
 # stuck turn cannot pile up unbounded fetches inside the page.
-CONCURRENCY = max(1, int(os.environ.get("KIMI_CONCURRENCY", "10")))
+CONCURRENCY = max(1, int(os.environ.get("KIMI_CONCURRENCY", "50")))
 _slots = threading.BoundedSemaphore(CONCURRENCY)
+# Per-model admission limits can be added here if a model's upstream queue
+# saturates; other models keep the global limit.
+PER_MODEL_CONCURRENCY = {}
+_model_slots = {}
+OVERLOAD_ATTEMPTS = max(1, int(os.environ.get("KIMI_OVERLOAD_ATTEMPTS", "2")))
 DUMP_DIR = os.environ.get("KIMI_DUMP_DIR", "")
 
 
@@ -86,17 +128,20 @@ class CdpError(RuntimeError):
 
 
 class Cdp:
-    def __init__(self):
+    def __init__(self, page_url=None):
+        self.page_url = page_url or PAGE_URL
         with urllib.request.urlopen(CDP_HTTP + "/json/list", timeout=10) as r:
             tabs = json.load(r)
         target = None
         for t in tabs:
-            if t.get("type") == "page" and "build.nvidia.com" in t.get("url", ""):
+            if t.get("type") == "page" and t.get("url", "").startswith(self.page_url.rstrip("/")):
                 target = t
                 break
         if target is None:
+            # Never reuse another model's tab: navigating it would kill its
+            # in-flight streams. Open a dedicated tab for this model instead.
             req = urllib.request.Request(
-                CDP_HTTP + "/json/new?" + urllib.parse.quote(PAGE_URL, safe=":/?=&"), method="PUT"
+                CDP_HTTP + "/json/new?" + urllib.parse.quote(self.page_url, safe=":/?=&"), method="PUT"
             )
             with urllib.request.urlopen(req, timeout=10) as r:
                 target = json.load(r)
@@ -109,13 +154,19 @@ class Cdp:
 
     def _ensure_page(self):
         try:
-            if self.js("typeof window.hcaptcha === 'object'", timeout=20) is True:
-                return
+            cur = self.js("location.href", timeout=10)
         except CdpError:
-            pass
-        log("reloading playground page for a fresh captcha context")
+            cur = None
+        on_page = isinstance(cur, str) and cur.startswith(self.page_url.rstrip("/"))
+        if on_page:
+            try:
+                if self.js("typeof window.hcaptcha === 'object'", timeout=20) is True:
+                    return
+            except CdpError:
+                pass
+        log("navigating playground tab to %s" % self.page_url)
         self.call("Page.enable", timeout=20)
-        self.call("Page.navigate", timeout=20, url=PAGE_URL)
+        self.call("Page.navigate", timeout=20, url=self.page_url)
         for _ in range(40):
             time.sleep(1.5)
             try:
@@ -128,7 +179,7 @@ class Cdp:
     def reload_page(self):
         try:
             self.call("Page.enable", timeout=20)
-            self.call("Page.navigate", timeout=20, url=PAGE_URL)
+            self.call("Page.navigate", timeout=20, url=self.page_url)
         except CdpError:
             return False
         for _ in range(40):
@@ -257,45 +308,46 @@ IMAGE_PLACEHOLDER = "[earlier image omitted to stay within the playground image 
 # parallel — necessary when several dsh sessions fire at once.
 TOKEN_TTL = float(os.environ.get("KIMI_TOKEN_TTL", "100"))
 ACTIVE_WINDOW = float(os.environ.get("KIMI_ACTIVE_WINDOW", "120"))
-TOKEN_POOL = int(os.environ.get("KIMI_TOKEN_POOL", "4"))
+TOKEN_POOL = int(os.environ.get("KIMI_TOKEN_POOL", "16"))
 _cache_lock = threading.Lock()
-_pool = []  # [(token, minted_at)] oldest first
+_pool = []  # [(token, minted_at, model_id)] oldest first
 _last_req = [0.0]
 _seen_tools = [False]
 _inflight = [0]
 _slot_locks = [threading.Lock() for _ in range(max(1, TOKEN_POOL))]
 
 
-def _mint_once(slot=0):
-    cdp = Cdp()
+def _mint_once(slot=0, page_url=None):
+    cdp = Cdp(page_url)
     try:
         return cdp.js(mint_js(slot), await_promise=True, timeout=180)
     finally:
         cdp.close()
 
 
-def take_cached_token():
+def take_cached_token(model_id=MODEL):
     with _cache_lock:
         now = time.time()
         while _pool and now - _pool[0][1] >= TOKEN_TTL:
             _pool.pop(0)
-        if _pool:
-            tok, at = _pool.pop(0)
-            log("using pre-minted captcha token (age %.0fs, %d left)" % (now - at, len(_pool)))
-            return tok
+        for i, (tok, at, mid) in enumerate(_pool):
+            if mid == model_id:
+                _pool.pop(i)
+                log("using pre-minted captcha token for %s (age %.0fs, %d left)" % (mid, now - at, len(_pool)))
+                return tok
     return None
 
 
-def _mint_any():
+def _mint_any(model_id=MODEL, page_url=None):
     """Mint on demand, using any free slot so parallel mints do not serialise."""
     for i, lk in enumerate(_slot_locks):
         if lk.acquire(blocking=False):
             try:
-                return _mint_once(i)
+                return _mint_once(i, page_url)
             finally:
                 lk.release()
     with _slot_locks[0]:
-        return _mint_once(0)
+        return _mint_once(0, page_url)
 
 
 def _premint_slot(slot):
@@ -304,10 +356,10 @@ def _premint_slot(slot):
             _inflight[0] -= 1
         return
     try:
-        tok = _mint_once(slot)
+        tok = _mint_once(slot, PAGE_URL)
         if tok:
             with _cache_lock:
-                _pool.append((tok, time.time()))
+                _pool.append((tok, time.time(), MODEL))
             log("pre-minted captcha token (pool %d/%d)" % (len(_pool), TOKEN_POOL))
     except Exception as e:  # noqa: BLE001
         log(f"premint failed: {e!r}")
@@ -366,22 +418,27 @@ def trim_images(messages, limit=MAX_IMAGES):
     return list(reversed(out))
 
 
-def build_upstream_body(req):
+def build_upstream_body(req, model_id=MODEL, model_cfg=None):
+    model_cfg = model_cfg or MODELS.get(model_id) or {}
     src = trim_images(req.get("messages") or [])
     effort = req.get("reasoning_effort") or os.environ.get("KIMI_DEFAULT_EFFORT", "none")
     requested = req.get("max_tokens") or req.get("max_completion_tokens")
-    requested = min(int(requested or 65536), 65536)
+    model_cap = int(model_cfg.get("max_out") or 65536)
+    requested = min(int(requested or model_cap), model_cap)
     # Ceiling only: the model may stop normally after any amount. Giving it the
     # whole NVIDIA allowance lets long reasoning still leave room for content.
-    max_tokens = 65536 if os.environ.get("KIMI_USE_MAX_OUTPUT", "1") == "1" else requested
+    max_tokens = model_cap if os.environ.get("KIMI_USE_MAX_OUTPUT", "1") == "1" else requested
     # Hidden reasoning shares max_tokens. Kimi Code's 'max' UI level is not an
     # NVIDIA wire value and can exhaust the budget with long hidden thinking.
     if effort == "max":
         effort = os.environ.get("KIMI_MAX_EFFORT_ALIAS", "high")
+    drop_effort = False
+    if model_cfg.get("drop_none_effort") and effort == "none":
+        drop_effort = True
     body = {
-        "reasoning_effort": effort,
+        **({} if drop_effort else {"reasoning_effort": effort}),
         "stream": True,
-        "model": MODEL,
+        "model": model_id,
         "seed": int(req.get("seed") or 0),
         "max_tokens": max_tokens,
         "messages": src,
@@ -433,10 +490,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 "object": "list",
                 "data": [{
-                    "id": MODEL, "object": "model", "created": int(time.time()),
-                    "owned_by": "moonshotai (nvidia playground bridge)",
-                    "context_length": 262144,
-                }],
+                    "id": mid, "object": "model", "created": int(time.time()),
+                    "owned_by": "nvidia playground bridge (%s)" % mid.split("/", 1)[0],
+                    "context_length": cfg.get("context", 262144),
+                } for mid, cfg in MODELS.items()],
             })
         if self.path.rstrip("/").endswith("/health"):
             return self._json(200, {"ok": True})
@@ -455,14 +512,23 @@ class Handler(BaseHTTPRequestHandler):
 
         dump("req", json.dumps(req, ensure_ascii=False))
 
+        model_id, cfg = resolve_model(req.get("model"))
+        if cfg is None:
+            return self._json(400, {"error": {
+                "message": "unknown model %r; available: %s" % (req.get("model"), ", ".join(sorted(MODELS))),
+                "type": "invalid_request_error",
+            }})
+        req["model"] = model_id
         want_stream = bool(req.get("stream"))
         waited = time.time()
-        _slots.acquire()
+        sem = _model_slots.get(model_id) or _slots
+        sem_desc = "global limit %d" % CONCURRENCY
+        sem.acquire()
         if time.time() - waited > 0.5:
-            log("queued %.0fs waiting for a free upstream slot (limit %d)"
-                % (time.time() - waited, CONCURRENCY))
+            log("queued %.0fs waiting for a free upstream slot (%s)"
+                % (time.time() - waited, sem_desc))
         try:
-            self._serve(req, want_stream)
+            self._serve(req, want_stream, model_id, cfg)
         except CdpError as e:
             log(f"upstream failure: {e}")
             self._fail(503, str(e))
@@ -472,7 +538,7 @@ class Handler(BaseHTTPRequestHandler):
             log(f"error: {e!r}")
             self._fail(500, str(e))
         finally:
-            _slots.release()
+            sem.release()
 
     def _fail(self, status, message):
         """Report an error without corrupting an already-open SSE response."""
@@ -486,10 +552,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(status, {"error": {"message": message, "type": "bridge_error"}})
 
-    def _serve(self, req, want_stream):
+    def _serve(self, req, want_stream, model_id=MODEL, cfg=None):
+        cfg = cfg or MODELS[model_id]
+        upstream = upstream_for(cfg)
+        fnid = cfg["fnid"]
+        page_url = cfg["page"]
         t0 = time.time()
-        body = build_upstream_body(req)
-        log(f"request model={req.get('model')} msgs={len(body['messages'])} stream={want_stream} effort={body['reasoning_effort']} tools={len(body.get('tools') or [])}")
+        body = build_upstream_body(req, model_id, cfg)
+        log(f"request model={model_id} msgs={len(body['messages'])} stream={want_stream} effort={body.get('reasoning_effort','none')} tools={len(body.get('tools') or [])}")
         if body.get("tools") and not _seen_tools[0]:
             _seen_tools[0] = True
             log("tool names: " + ", ".join((t.get("function") or {}).get("name", "?")
@@ -499,13 +569,13 @@ class Handler(BaseHTTPRequestHandler):
         _last_req[0] = t_paced
 
         with _lock:
-            cdp = Cdp()
+            cdp = Cdp(page_url)
         t_cdp = time.time()
         t_mint = t_cdp
         try:
-            token = take_cached_token()
+            token = take_cached_token(model_id)
             if not token:
-                token = _mint_any()
+                token = _mint_any(model_id, page_url)
             if not token:
                 raise CdpError("hCaptcha mint failed (page may need a visible browser)")
             t_mint = time.time()
@@ -513,7 +583,7 @@ class Handler(BaseHTTPRequestHandler):
             stream = self._open(want_stream, req)
             ok = False
             last = "upstream rejected the request"
-            for attempt in range(5):
+            for attempt in range(OVERLOAD_ATTEMPTS):
                 self._captcha_error = False
                 self._retryable = False
                 self._stream_started = False
@@ -522,13 +592,13 @@ class Handler(BaseHTTPRequestHandler):
                 if attempt:
                     # A failed attempt consumes the captcha token, so every
                     # retry needs a brand new one before hitting upstream again.
-                    token = take_cached_token() or _mint_any()
+                    token = take_cached_token(model_id) or _mint_any(model_id, page_url)
                     if not token:
                         raise CdpError("hCaptcha mint failed (page may need a visible browser)")
                 # unique per request: two requests landing in the same millisecond
                 # would otherwise share a binding name and their streams would mix.
                 binding = "kimiChunk" + uuid.uuid4().hex[:16]
-                ok = self._relay(cdp, body, token, binding, stream, want_stream)
+                ok = self._relay(cdp, body, token, binding, stream, want_stream, upstream, fnid)
                 if ok:
                     break
                 if self._stream_started:
@@ -551,9 +621,9 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 if self._retryable:
                     last = "NVIDIA inference pool is saturated (HTTP 5xx), try again in a minute"
-                    if attempt == 4:
+                    if attempt == OVERLOAD_ATTEMPTS - 1:
                         break
-                    delay = (5, 15, 30, 45)[attempt]
+                    delay = (5, 15)[min(attempt, 1)]
                     log(f"upstream overloaded; retrying in {delay}s")
                     time.sleep(delay)
                     continue
@@ -579,13 +649,13 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return {"chunks": []}
 
-    def _relay(self, cdp, body, token, binding, stream, want_stream):
+    def _relay(self, cdp, body, token, binding, stream, want_stream, upstream=UPSTREAM, fnid=FUNCTION_ID):
         cdp.call("Runtime.addBinding", name=binding)
         js = STREAM_JS % {
             "binding": json.dumps(binding),
-            "url": json.dumps(UPSTREAM),
+            "url": json.dumps(upstream),
             "token": json.dumps(token),
-            "fnid": json.dumps(FUNCTION_ID),
+            "fnid": json.dumps(fnid),
             "body": json.dumps(json.dumps(body)),
         }
         cdp.call("Runtime.evaluate", expression=js, returnByValue=False, awaitPromise=False)
@@ -779,7 +849,7 @@ class Handler(BaseHTTPRequestHandler):
     def _merge_sse(text, body):
         content, reasoning, usage, rid, created, finish = [], [], None, None, None, None
         tools = {}
-        model = MODEL
+        model = body.get("model") or MODEL
         for line in text.splitlines():
             line = line.strip()
             if not line.startswith("data:"):
@@ -837,7 +907,7 @@ def main():
     threading.Thread(target=_premint_loop, name="premint", daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     srv.daemon_threads = True
-    log(f"listening on http://127.0.0.1:{PORT}/v1 (model {MODEL})")
+    log(f"listening on http://127.0.0.1:{PORT}/v1 (default model {MODEL}; available: {', '.join(sorted(MODELS))})")
     srv.serve_forever()
 
 
