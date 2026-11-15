@@ -400,7 +400,10 @@ def _premint_loop():
 # NVIDIA rejects any request body over ~10 MB with HTTP 413 ("Content Too
 # Large"). Oversized payloads are almost always embedded base64 images or a
 # bloated history, so shrink toward the cap instead of failing the whole turn.
-# Budget is configurable; the target stays below NVIDIA's hard 10 MB limit.
+# Trimming only kicks in once a request crosses PAYLOAD_TRIGGER (8 MB by
+# default); anything smaller is forwarded untouched. The shrink target
+# (PAYLOAD_BUDGET, 9 MB) stays below NVIDIA's hard 10 MB limit.
+PAYLOAD_TRIGGER = int(os.environ.get("KIMI_PAYLOAD_TRIGGER", str(8 * 1024 * 1024)))
 PAYLOAD_BUDGET = int(os.environ.get("KIMI_PAYLOAD_BUDGET", str(9 * 1024 * 1024)))
 PAYLOAD_PLACEHOLDER = "[earlier content omitted: request exceeded the playground payload limit]"
 
@@ -423,11 +426,13 @@ def _msg_bytes(msg):
     return len(str(content or "")) + 64
 
 
-def fit_payload_budget(body, budget=PAYLOAD_BUDGET):
+def fit_payload_budget(body, budget=PAYLOAD_BUDGET, trigger=PAYLOAD_TRIGGER):
     """Shrink `body['messages']` until the serialized request fits `budget`.
 
-    Strategy: blank the largest base64 images first (newest kept), then drop the
-    oldest history turns. A text placeholder preserves conversational context.
+    No-op unless the body already exceeds `trigger` (8 MB): below that the
+    request is forwarded as-is. Strategy: blank the largest base64 images first
+    (newest kept), then drop the oldest history turns. A text placeholder
+    preserves conversational context.
     """
     def total():
         try:
@@ -435,7 +440,7 @@ def fit_payload_budget(body, budget=PAYLOAD_BUDGET):
         except Exception:
             return budget + 1
 
-    if total() <= budget:
+    if total() <= trigger:
         return body
     before = total()
     msgs = list(body.get("messages") or [])
