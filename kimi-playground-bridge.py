@@ -397,6 +397,108 @@ def _premint_loop():
             time.sleep(3)
 
 
+# NVIDIA rejects any request body over ~10 MB with HTTP 413 ("Content Too
+# Large"). Oversized payloads are almost always embedded base64 images or a
+# bloated history, so shrink toward the cap instead of failing the whole turn.
+# Budget is configurable; the target stays below NVIDIA's hard 10 MB limit.
+PAYLOAD_BUDGET = int(os.environ.get("KIMI_PAYLOAD_BUDGET", str(9 * 1024 * 1024)))
+PAYLOAD_PLACEHOLDER = "[earlier content omitted: request exceeded the playground payload limit]"
+
+
+def _part_bytes(part):
+    if not isinstance(part, dict):
+        return 0
+    if part.get("type") in ("image_url", "input_image"):
+        url = part.get("image_url") or part.get("input_image") or {}
+        if isinstance(url, dict):
+            url = url.get("url") or ""
+        return len(str(url)) + 64
+    return len(str(part.get("text") or "")) + 32
+
+
+def _msg_bytes(msg):
+    content = msg.get("content")
+    if isinstance(content, list):
+        return sum(_part_bytes(p) for p in content) + 64
+    return len(str(content or "")) + 64
+
+
+def fit_payload_budget(body, budget=PAYLOAD_BUDGET):
+    """Shrink `body['messages']` until the serialized request fits `budget`.
+
+    Strategy: blank the largest base64 images first (newest kept), then drop the
+    oldest history turns. A text placeholder preserves conversational context.
+    """
+    def total():
+        try:
+            return len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+        except Exception:
+            return budget + 1
+
+    if total() <= budget:
+        return body
+    before = total()
+    msgs = list(body.get("messages") or [])
+
+    # Pass 1: replace the largest embedded images with a placeholder.
+    imgs = []
+    for i, m in enumerate(msgs):
+        c = m.get("content")
+        if isinstance(c, list):
+            for j, p in enumerate(c):
+                if isinstance(p, dict) and p.get("type") in ("image_url", "input_image"):
+                    imgs.append((_part_bytes(p), i, j))
+    for size, i, j in sorted(imgs, reverse=True):
+        if total() <= budget:
+            break
+        c = list(msgs[i]["content"])
+        c[j] = {"type": "text", "text": PAYLOAD_PLACEHOLDER}
+        msgs[i] = {**msgs[i], "content": c}
+        body = {**body, "messages": msgs}
+
+    # Pass 2: drop the oldest non-system turns until it fits.
+    while total() > budget and len(msgs) > 2:
+        for k, m in enumerate(msgs):
+            if m.get("role") != "system":
+                msgs = msgs[:k] + msgs[k + 1:]
+                break
+        else:
+            break
+        body = {**body, "messages": msgs}
+
+    # Pass 3: a single huge text part can exceed the budget on its own; hard-truncate
+    # the largest text parts so the serialized body always lands under the cap.
+    guard = 0
+    while total() > budget and guard < 200:
+        guard += 1
+        over = total() - budget + 256
+        biggest = None
+        for i, m in enumerate(msgs):
+            c = m.get("content")
+            if isinstance(c, str) and len(c) > 512:
+                if biggest is None or len(c) > biggest[0]:
+                    biggest = (len(c), i, None)
+            elif isinstance(c, list):
+                for j, p in enumerate(c):
+                    if isinstance(p, dict) and p.get("type") == "text" and len(p.get("text") or "") > 512:
+                        if biggest is None or len(p["text"]) > biggest[0]:
+                            biggest = (len(p["text"]), i, j)
+        if biggest is None:
+            break
+        _, i, j = biggest
+        c = msgs[i]["content"]
+        if j is None:
+            msgs[i] = {**msgs[i], "content": c[:-over] + "\n" + PAYLOAD_PLACEHOLDER}
+        else:
+            parts = list(c)
+            parts[j] = {**parts[j], "text": parts[j]["text"][:-over] + "\n" + PAYLOAD_PLACEHOLDER}
+            msgs[i] = {**msgs[i], "content": parts}
+        body = {**body, "messages": msgs}
+
+    log("payload trimmed: %d -> %d bytes (budget %d)" % (before, total(), budget))
+    return body
+
+
 def trim_images(messages, limit=MAX_IMAGES):
     """Keep only the newest `limit` images; older ones become a text placeholder."""
     seen = 0
@@ -450,7 +552,7 @@ def build_upstream_body(req, model_id=MODEL, model_cfg=None):
     for k in ("tools", "tool_choice", "response_format", "parallel_tool_calls"):
         if req.get(k) is not None:
             body[k] = req[k]
-    return body
+    return fit_payload_budget(body)
 
 
 def _sse_is_finished(buf):
